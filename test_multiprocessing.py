@@ -31,12 +31,22 @@ class Unarchiving(object):
      * Pool Map
      * Queue
      * Ordered queue
+
+    There are 2 types of processing:
+     * map
+     * queue
+    
+    There are 2 types of queues:
+     * simple
+     * ordered
     """
 
     def __init__(self, dir_name, output_dir_name):
         self.process_count = cpu_count()
         self.dir_name = dir_name
         self.output_dir_name = output_dir_name
+        self.inputqueue = None
+        self.processing_failed = None
 
     def unarchive(self, filename):
         """
@@ -48,36 +58,31 @@ class Unarchiving(object):
         with ZipFile(filename, 'r') as zip:
             zip.extractall(self.output_dir_name)
 
-    def process_queue(self, inputqueue):
+    def process_queue(self):
         """
         Unzip files in queue.
-
-        Params:
-         * inputqueue - shared queue
         """
-        while not inputqueue.empty():
-            filename = inputqueue.get()
+        while not self.inputqueue.empty():
+            filename = self.inputqueue.get()
             try:
                 self.unarchive(filename)
-            except Exception:
-                # Kind of fail fast
-                while not inputqueue.empty():
-                    inputqueue.get()
+            except Exception as e:
+                self._clear_queue()
+                self.processing_failed.put(e)
 
-    def get_input_queue(self):
+    def set_input_queue(self):
         """
         Prepeare simple queue.
 
         Returns:
          * Queue - simple queue
         """
-        inputqueue = Queue()
         for root, _, files in os.walk(self.dir_name):
             for filename in files:
-                inputqueue.put(os.path.join(root, filename))
-        return inputqueue
+                self.inputqueue.put(os.path.join(root, filename))
+        return self.inputqueue
 
-    def get_ordered_input_queue(self):
+    def set_ordered_input_queue(self):
         """
         Prepeare ordered queue.
         Approach more efficient than simple queue for unarchiving.
@@ -98,10 +103,9 @@ class Unarchiving(object):
             reverse=True,
         ))
 
-        inputqueue = Queue()
         for path in paths:
-            inputqueue.put(path)
-        return inputqueue
+            self.inputqueue.put(path)
+        return self.inputqueue
 
     def process_using_map(self, *args, **kwargs):
         """
@@ -129,15 +133,17 @@ class Unarchiving(object):
         """
         queue_type = kwargs.get('queue_type')
         queue_types_functions = {
-            'simple': self.get_input_queue,
-            'ordered': self.get_ordered_input_queue,
+            'simple': self.set_input_queue,
+            'ordered': self.set_ordered_input_queue,
         }
-        get_queue = queue_types_functions.get(queue_type)
-        inputqueue = get_queue()
+        self.inputqueue = Queue()
+        self.processing_failed = Queue()
+        set_queue = queue_types_functions.get(queue_type)
+        self.inputqueue = set_queue()
         producers = [
             Process(
                 target=self.process_queue,
-                args=(inputqueue,),
+                args=(),
             ) for _ in range(self.process_count)
         ]
 
@@ -146,6 +152,9 @@ class Unarchiving(object):
 
         for process in producers:
             process.join()
+        
+        if not self.processing_failed.empty():
+            raise Exception(self.processing_failed.get())
 
     @timeit
     def run(self, ttype, *args, **kwargs):
@@ -163,6 +172,18 @@ class Unarchiving(object):
         }
         process = types_process_functions.get(ttype)
         process(*args, **kwargs)
+
+    def _clear_queue(self):
+        """
+        Clear input queue.
+
+        There are 2 ways to clear multiprocessing queue:
+        1) get items from queue while it's not empty;
+        2) assign new queue to queue variable.
+
+        2 option is chosen.
+        """
+        self.inputqueue = Queue()
 
 
 if __name__ == '__main__':
